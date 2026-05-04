@@ -1,0 +1,11 @@
+*.cdb
+*.db
+*.avz
+*.avzm
+*.wbpj
+*.mechdb
+*.out
+*.err
+__pycache__/
+*.pyc
+.env

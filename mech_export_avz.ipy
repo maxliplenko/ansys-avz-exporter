@@ -1,0 +1,1418 @@
+# -*- coding: utf-8 -*-
+"""
+mech_export_avz.ipy - AVZ Export Template for ANSYS Mechanical
+================================================================
+
+IronPython 2.7 script executed inside Mechanical via Workbench.
+All {{PLACEHOLDER}} tokens are replaced by the Python orchestrator.
+
+IMPORTANT: IronPython 2.7 Limitations
+- No f-strings (use % formatting)
+- No type annotations
+- No modern Python 3 features
+- ASCII-safe only
+"""
+
+import os
+import sys
+import json
+import traceback
+from Ansys.Mechanical.DataModel import MechanicalEnums
+
+# -------------------- SCRIPT META --------------------
+
+SCRIPT_NAME = "mech_export_avz"
+SCRIPT_VERSION = "0.9.1"      # semver: major.minor.patch
+SCRIPT_API = 1
+
+# -----------------------------------------------------
+
+# ==============================================================================
+# INJECTED CONFIGURATION
+# ==============================================================================
+
+CDB_PATH = {{CDB_PATH}}
+RST_PATH = {{RST_PATH}}
+OUT_DIR = {{OUT_DIR}}
+JOB = {{JOB}}
+STATUS_JSON = {{STATUS_JSON}}
+
+IMPORT_UNITS_ENUM_NAME = {{IMPORT_UNITS_ENUM}}
+MODEL_RESULT_UNITS_ENUM_NAME = {{MODEL_RESULT_UNITS_ENUM}}
+DISPLAY_UNITS_ENUM_NAME = {{DISPLAY_UNITS_ENUM}}
+
+TIME_SEL = {{TIME_SEL}}
+TIME_SELECTED_MODE = {{TIME_SELECTED_MODE}}
+TIME_SELECTED_INDEX = {{TIME_SELECTED_INDEX}}
+TIME_SELECTED_TIME = {{TIME_SELECTED_TIME}}
+
+TRUE_SCALE = {{TRUE_SCALE}}
+DEFORM_SCALE = {{DEFORM_SCALE}}
+SHOW_THICKNESS = {{SHOW_THICKNESS}}
+SHOW_MESH = {{SHOW_MESH}}
+DO_EVAL = {{DO_EVAL}}
+MAKE_AVZM = {{MAKE_AVZM}}
+
+RESULTS = {{RESULTS_LIST_JSON}}
+
+VERBOSE={{VERBOSE}}
+
+# ==============================================================================
+# LOGGING INFRASTRUCTURE
+# ==============================================================================
+
+LOG_MESSAGES = []
+
+class Logger(object):
+    """Logging utility for IronPython."""
+    
+    @staticmethod
+    def _write(level, message):
+        """Write log message to stdout."""
+        try:
+            sys.stdout.write("[IPY-%s] %s\n" % (level, str(message)))
+            sys.stdout.flush()
+        except:
+            pass
+
+        """Write log message to json."""
+        try:
+            LOG_MESSAGES.append({
+                "level": level,
+                "message": str(message),
+            })
+        except:
+            pass
+    
+    @staticmethod
+    def info(msg):
+        Logger._write("INFO", msg)
+    
+    @staticmethod
+    def warning(msg):
+        Logger._write("WARN", msg)
+    
+    @staticmethod
+    def error(msg):
+        Logger._write("ERROR", msg)
+    
+    @staticmethod
+    def debug(msg):
+        Logger._write("DEBUG", msg)
+
+
+class ExecutionError(Exception):
+    """Custom exception for controlled failures."""
+    pass
+
+
+# ==============================================================================
+# STATUS REPORTING
+# ==============================================================================
+
+class StatusReporter(object):
+    """Write execution status to JSON file."""
+    
+    @staticmethod
+    def _ensure_dir(path):
+        """Ensure directory exists."""
+        try:
+            dirname = os.path.dirname(path)
+            if dirname and not os.path.isdir(dirname):
+                os.makedirs(dirname)
+        except:
+            pass
+    
+    @staticmethod
+    def _write_json(payload):
+        """Write JSON payload to status file."""
+        StatusReporter._ensure_dir(STATUS_JSON)
+        
+        try:
+            f = open(STATUS_JSON, "w")
+            try:
+                json.dump(payload, f, indent=2)
+            finally:
+                f.close()
+        except Exception as e:
+            Logger.error("Failed to write status: %s" % str(e))
+    
+    @staticmethod
+    def success(job, files, results):
+        """Report successful execution."""
+        payload = {
+            "job": job,
+            "ok": True,
+            "error": "",
+            "traceback": "",
+            "files": files,
+            "avz": files,
+            "results": results,
+            "log": LOG_MESSAGES,
+        }
+        StatusReporter._write_json(payload)
+    
+    @staticmethod
+    def failure(job, error_msg, tb_text=None):
+        """Report execution failure."""
+        payload = {
+            "job": job,
+            "ok": False,
+            "error": str(error_msg),
+            "traceback": tb_text or "",
+            "files": [],
+            "results": [],
+            "log": LOG_MESSAGES,
+        }
+        StatusReporter._write_json(payload)
+
+
+# ==============================================================================
+# ENUM UTILITIES
+# ==============================================================================
+
+class EnumResolver(object):
+    """Helper for accessing Mechanical enums."""
+    
+    @staticmethod
+    def get_value(enum_type, name):
+        """Get enum value by name."""
+        try:
+            return getattr(enum_type, str(name), None)
+        except:
+            return None
+    
+    @staticmethod
+    def try_names(enum_type, names):
+        """Try multiple names, return first match."""
+        for name in names:
+            val = EnumResolver.get_value(enum_type, name)
+            if val is not None:
+                return val
+        return None
+
+
+# ==============================================================================
+# UNIT SYSTEM CONFIGURATION
+# ==============================================================================
+
+class UnitSystemManager(object):
+    """Configure Mechanical unit systems."""
+    
+    UNIT_MAP = {
+        "UNITSBIN": "StandardBIN",
+        "UNITSBFT": "StandardBFT",
+        "UNITSNMM": "StandardNMM",
+        "UNITSMKS": "StandardMKS",
+        "UNITSCGS": "StandardCGS",
+        "UNITSUMKS": "StandardUMKS",
+        "UNITSNMMDAT": "StandardNMMdat",
+        "UNITSNMMTON": "StandardNMMton",
+    }
+    
+    @staticmethod
+    def set_display_units(enum_name):
+        """Set project display unit system."""
+        try:
+            from Ansys.Mechanical.DataModel.Enums import UserUnitSystemType
+        except:
+            Logger.warning("UserUnitSystemType not available")
+            return
+        
+        try:
+            key = str(enum_name).upper()
+            attr_name = UnitSystemManager.UNIT_MAP.get(key)
+            
+            if attr_name and hasattr(UserUnitSystemType, attr_name):
+                ExtAPI.DataModel.Project.UnitSystem = getattr(
+                    UserUnitSystemType, attr_name
+                )
+                Logger.info("Display units set to: %s" % attr_name)
+            else:
+                Logger.warning("Unknown display units: %s" % enum_name)
+        except Exception as e:
+            Logger.warning("Failed to set display units: %s" % str(e))
+
+
+# ==============================================================================
+# GEOMETRY VALIDATION
+# ==============================================================================
+
+class GeometryValidator(object):
+    """Validate geometry loaded via Workbench."""
+    
+    @staticmethod
+    def validate():
+        """Verify geometry is available."""
+        Logger.info("Validating geometry...")
+        
+        try:
+            model = ExtAPI.DataModel.Project.Model
+        except:
+            raise ExecutionError(
+                "Model not available. Must run inside Mechanical."
+            )
+        
+        geometry = getattr(model, "Geometry", None)
+        if geometry is None:
+            raise ExecutionError("Model.Geometry not available")
+        
+        # Check bodies
+        bodies = 0
+        try:
+            bodies = int(getattr(geometry, "Bodies", 0))
+        except:
+            bodies = 0
+        
+        if bodies <= 0:
+            raise ExecutionError(
+                "No geometry bodies. External Model transfer required."
+            )
+        
+        Logger.info("Geometry OK: %d bodies" % bodies)
+        
+        # Log mesh info
+        try:
+            elems = int(getattr(geometry, "Elements", 0))
+            nodes = int(getattr(geometry, "Nodes", 0))
+            if elems > 0:
+                Logger.info("Mesh: %d elements, %d nodes" % (elems, nodes))
+        except:
+            pass
+        
+        return model
+
+
+# ==============================================================================
+# ANALYSIS LOCATOR
+# ==============================================================================
+
+class AnalysisLocator(object):
+    """Locate analysis in model."""
+    
+    @staticmethod
+    def get_analysis():
+        """Get first analysis from model."""
+        Logger.info("Locating analysis...")
+        model = ExtAPI.DataModel.Project.Model
+        
+        analyses = getattr(model, "Analyses", None)
+        if analyses is None:
+            raise ExecutionError("Model.Analyses not available")
+        
+        try:
+            count = len(analyses)
+        except:
+            analyses = list(analyses)
+            count = len(analyses)
+        
+        if count == 0:
+            raise ExecutionError("No analysis found")
+        
+        analysis = analyses[0]
+        name = str(getattr(analysis, "Name", "Unknown"))
+        Logger.info("Using analysis: %s" % name)
+        
+        return analysis
+
+
+# ==============================================================================
+# RST READER
+# ==============================================================================
+
+class RSTReader(object):
+    """Read RST results into Solution."""
+    
+    @staticmethod
+    def read_results(solution, rst_path, units_enum_name):
+        """Read RST file into solution."""
+        Logger.info("Reading RST: %s" % rst_path)
+        
+        try:
+            from Ansys.Mechanical.DataModel.Enums import UnitSystemIDType
+        except:
+            raise ExecutionError("Cannot import UnitSystemIDType")
+        
+        units_enum = EnumResolver.get_value(UnitSystemIDType, units_enum_name)
+        if units_enum is None:
+            raise ExecutionError("Invalid units enum: %s" % units_enum_name)
+        
+        success = False
+        
+        # Try modern API
+        if hasattr(solution, "ReadGivenAnsysResultFileByReference"):
+            try:
+                solution.ReadGivenAnsysResultFileByReference(
+                    rst_path, units_enum
+                )
+                Logger.info("RST loaded (ByReference)")
+                success = True
+            except Exception as e:
+                Logger.debug("ByReference failed: %s" % str(e))
+        
+        # Fallback
+        if not success and hasattr(solution, "ReadGivenAnsysResultFile"):
+            try:
+                solution.ReadGivenAnsysResultFile(rst_path, units_enum)
+                Logger.info("RST loaded (standard)")
+                success = True
+            except Exception as e:
+                msg = str(e).lower()
+                if "copy" in msg or "copying" in msg:
+                    Logger.warning("RST copy warning (non-critical)")
+                    success = True
+                else:
+                    raise ExecutionError("RST read failed: %s" % str(e))
+        
+        if not success:
+            raise ExecutionError("Could not load RST")
+
+
+# ==============================================================================
+# TIME SELECTION
+# ==============================================================================
+
+class TimeSelector(object):
+    """Set solution time/result set."""
+    
+    @staticmethod
+    def set_solution_time(solution, target_index):
+        """Set CurrentResultSet on solution."""
+        idx = int(target_index)
+        
+        if idx <= 0:
+            Logger.info("Index <= 0: keeping default result set")
+            return True
+        
+        Logger.info("Setting CurrentResultSet to index: %d" % idx)
+        ok = False
+        
+        # Try solution property first
+        try:
+            if hasattr(solution, "CurrentResultSet"):
+                solution.CurrentResultSet = idx
+                Logger.info("Solution.CurrentResultSet = %d" % idx)
+                ok = True
+        except Exception as e:
+            Logger.debug("Failed to set CurrentResultSet: %s" % str(e))
+        
+        # Try result reader
+        try:
+            analysis = ExtAPI.DataModel.Project.Model.Analyses[0]
+            if hasattr(analysis, "GetResultsData"):
+                reader = analysis.GetResultsData()
+                if reader and hasattr(reader, "CurrentResultSet"):
+                    reader.CurrentResultSet = idx
+                    Logger.info("Reader.CurrentResultSet = %d" % idx)
+                    ok = True
+        except Exception as e:
+            Logger.debug("Failed to set reader: %s" % str(e))
+        
+        if not ok:
+            Logger.warning("Could not set CurrentResultSet via standard methods")
+        
+        return ok
+    
+    @staticmethod
+    def set_via_temp_result(solution, target_index):
+        """Set time via temporary result object."""
+        tmp = None
+        try:
+            if hasattr(solution, "AddTotalDeformation"):
+                tmp = solution.AddTotalDeformation()
+        except:
+            return False
+        
+        if tmp is None:
+            return False
+        
+        try:
+            idx = int(target_index)
+            
+            if hasattr(tmp, "SetNumber"):
+                tmp.SetNumber = idx
+            
+            if hasattr(tmp, "EvaluateAllResults"):
+                tmp.EvaluateAllResults()
+            elif hasattr(tmp, "Evaluate"):
+                tmp.Evaluate()
+            
+            if hasattr(tmp, "Activate"):
+                tmp.Activate()
+            
+            try:
+                solution.CurrentResultSet = idx
+            except:
+                pass
+            
+            try:
+                tmp.Delete()
+            except:
+                pass
+            
+            Logger.info("Time set via temp result (idx=%d)" % idx)
+            return True
+            
+        except Exception as e:
+            Logger.debug("Temp result method failed: %s" % str(e))
+            return False
+
+
+# ==============================================================================
+# DPF TIME RESOLUTION
+# ==============================================================================
+
+class DPFTimeResolver(object):
+    """Use DPF to resolve time to index."""
+    
+    @staticmethod
+    def _get_times_from_rst(rst_path):
+        """Get time list from RST via DPF."""
+        try:
+            import mech_dpf
+            import Ans.DataProcessing as dpf
+        except:
+            Logger.warning("DPF modules not available")
+            return None
+        
+        try:
+            mech_dpf.setExtAPI(ExtAPI)
+        except:
+            pass
+        
+        try:
+            ds = dpf.DataSources(str(rst_path))
+            model = dpf.Model(ds)
+        except Exception as e:
+            Logger.warning("DPF Model failed: %s" % str(e))
+            return None
+        
+        # Get TimeFreqSupport
+        tf = None
+        try:
+            tf = model.TimeFreqSupport
+        except:
+            try:
+                tf = model.Metadata.TimeFreqSupport
+            except:
+                tf = None
+        
+        if tf is None:
+            Logger.warning("TimeFreqSupport not available")
+            return None
+        
+        # Extract times
+        try:
+            time_container = tf.TimeFreqs
+        except Exception as e:
+            Logger.warning("TimeFreqs failed: %s" % str(e))
+            return None
+        
+        try:
+            raw_times = time_container.Data
+        except:
+            raw_times = time_container
+        
+        if raw_times is None:
+            return None
+        
+        times = []
+        for t in raw_times:
+            try:
+                times.append(float(t))
+            except:
+                pass
+        
+        if times:
+            Logger.info("DPF: probed %d time steps" % len(times))
+        
+        return times
+    
+    @staticmethod
+    def resolve_time_to_index(rst_path, target_time):
+        """Find closest index for target time."""
+        times = DPFTimeResolver._get_times_from_rst(rst_path)
+        if not times:
+            return None
+        
+        try:
+            target = float(target_time)
+        except:
+            Logger.warning("Invalid target time: %s" % str(target_time))
+            return None
+        
+        best_idx = 0
+        best_diff = abs(times[0] - target)
+        
+        for i in range(1, len(times)):
+            diff = abs(times[i] - target)
+            if diff < best_diff:
+                best_diff = diff
+                best_idx = i
+        
+        result_idx = best_idx + 1
+        Logger.info(
+            "DPF: time=%s -> index=%d (actual=%s)" %
+            (str(target), result_idx, str(times[best_idx]))
+        )
+        
+        return result_idx
+
+
+# ==============================================================================
+# ANALYSIS SETTINGS
+# ==============================================================================
+
+class AnalysisSettings(object):
+    """Access analysis settings."""
+    
+    @staticmethod
+    def get_settings():
+        """Get analysis settings object."""
+        try:
+            analysis = ExtAPI.DataModel.Project.Model.Analyses[0]
+            return analysis.AnalysisSettings
+        except:
+            return None
+    
+    @staticmethod
+    def clamp_step_index(step_index):
+        """Clamp step index to valid range."""
+        settings = AnalysisSettings.get_settings()
+        if settings is None:
+            return None
+        
+        try:
+            n_steps = settings.NumberOfSteps
+        except:
+            return None
+        
+        idx = max(1, int(step_index))
+        idx = min(idx, n_steps)
+        
+        return idx
+    
+    @staticmethod
+    def get_step_end_time(step_index):
+        """Get end time for step."""
+        settings = AnalysisSettings.get_settings()
+        if settings is None:
+            return None
+        
+        try:
+            idx = AnalysisSettings.clamp_step_index(step_index)
+            if idx is None:
+                return None
+            
+            t_val = settings.GetStepEndTime(idx)
+            
+            # Try to extract numeric value
+            try:
+                return float(getattr(t_val, "Value", t_val))
+            except:
+                return float(t_val)
+        except:
+            return None
+
+
+# ==============================================================================
+# RESULT TIME CONFIGURATION
+# ==============================================================================
+
+class ResultTimeConfig(object):
+    """Configure time on result objects."""
+    
+    @staticmethod
+    def configure_for_index(result_obj, step_index):
+        """Configure result for INDEX mode (use index as-is)."""
+        try:
+            idx = int(step_index)
+        except:
+            Logger.warning("Invalid step index: %s" % str(step_index))
+            return
+        
+        if idx <= 0:
+            Logger.warning("Non-positive step index: %s" % str(idx))
+            return
+        
+        name = str(getattr(result_obj, "Name", "Unknown"))
+        
+        # Set driver to ResultSet
+        try:
+            from Ansys.Mechanical.DataModel.Enums import SetDriverStyle
+            if hasattr(result_obj, "By"):
+                result_obj.By = SetDriverStyle.ResultSet
+                Logger.debug("%s.By = ResultSet" % name)
+        except Exception as e:
+            Logger.debug("SetDriverStyle failed: %s" % str(e))
+        
+        # Set index
+        try:
+            if hasattr(result_obj, "SetNumber"):
+                result_obj.SetNumber = idx
+                Logger.info("%s.SetNumber = %d" % (name, idx))
+        except Exception as e:
+            Logger.warning("SetNumber failed: %s" % str(e))
+        
+        # Set DisplayTime from step end time
+        t_val = AnalysisSettings.get_step_end_time(idx)
+        if t_val is not None:
+            try:
+                if hasattr(result_obj, "DisplayTime"):
+                    result_obj.DisplayTime = t_val
+                    Logger.debug("%s.DisplayTime set from step end time" % name)
+            except Exception as e:
+                Logger.debug("DisplayTime failed: %s" % str(e))
+    
+    @staticmethod
+    def configure_for_value(result_obj, target_time):
+        """Configure result for VALUE mode."""
+        try:
+            t_val = float(target_time)
+        except:
+            Logger.warning("Invalid time value: %s" % str(target_time))
+            return
+        
+        if t_val < 0.0:
+            Logger.warning("Negative time: %s" % str(t_val))
+            return
+        
+        name = str(getattr(result_obj, "Name", "Unknown"))
+        
+        # Set driver to Time
+        try:
+            from Ansys.Mechanical.DataModel.Enums import SetDriverStyle
+            if hasattr(result_obj, "By"):
+                result_obj.By = SetDriverStyle.Time
+                Logger.debug("%s.By = Time" % name)
+        except Exception as e:
+            Logger.debug("SetDriverStyle failed: %s" % str(e))
+        
+        # Set DisplayTime
+        try:
+            qt = Quantity(t_val, "sec")
+            if hasattr(result_obj, "DisplayTime"):
+                result_obj.DisplayTime = qt
+                Logger.info("%s.DisplayTime = %s sec" % (name, str(t_val)))
+        except Exception as e:
+            Logger.warning("DisplayTime failed: %s" % str(e))
+    
+    @staticmethod
+    def configure(result_obj, mode, index, time):
+        """Configure based on TIME_SELECTED_MODE."""
+        mode_str = str(mode).upper()
+        
+        if mode_str == "INDEX":
+            Logger.info("Configuring for INDEX mode")
+            ResultTimeConfig.configure_for_index(result_obj, index)
+        elif mode_str == "VALUE":
+            Logger.info("Configuring for VALUE mode")
+            ResultTimeConfig.configure_for_value(result_obj, time)
+        else:
+            Logger.info("LAST mode: using defaults")
+
+
+# ==============================================================================
+# DEFORMATION SCALE
+# ==============================================================================
+
+class DeformationScale(object):
+    """Configure deformation scale."""
+    
+    @staticmethod
+    def configure():
+        """Apply deformation scale settings."""
+        Logger.info(
+            "Deformation: TRUE_SCALE=%s, SCALE=%s" %
+            (str(TRUE_SCALE), str(DEFORM_SCALE))
+        )
+        
+        try:
+            pref = ExtAPI.Graphics.ViewOptions.ResultPreference
+        except Exception as e:
+            Logger.warning("ResultPreference not available: %s" % str(e))
+            return
+        
+        # Set scaling mode
+        try:
+            from Ansys.Mechanical.DataModel import MechanicalEnums
+            
+            if TRUE_SCALE:
+                pref.DeformationScaling = (
+                    MechanicalEnums.Graphics.DeformationScaling.True
+                )
+                Logger.info("DeformationScaling = True")
+            else:
+                pref.DeformationScaling = (
+                    MechanicalEnums.Graphics.DeformationScaling.Auto
+                )
+                Logger.info("DeformationScaling = Auto")
+        except Exception as e:
+            Logger.warning("DeformationScaling failed: %s" % str(e))
+        
+        # Set multiplier
+        try:
+            scale = float(DEFORM_SCALE)
+            pref.DeformationScaleMultiplier = scale
+            Logger.info("DeformationScaleMultiplier = %s" % str(scale))
+        except Exception as e:
+            Logger.warning("Multiplier failed: %s" % str(e))
+        
+        # Show deformed shape
+        try:
+            if hasattr(pref, "ShowDeformation"):
+                pref.ShowDeformation = True
+        except:
+            pass
+        
+        try:
+            if hasattr(pref, "DeformedShape"):
+                pref.DeformedShape = True
+        except:
+            pass
+
+
+# ==============================================================================
+# SHELL / BEAM THICKNESS DISPLAY
+# ==============================================================================
+
+class ThicknessDisplay(object):
+    """Configure shell/beam thickness visualization."""
+
+    @staticmethod
+    def configure():
+        """Apply thickness display settings."""
+        Logger.info("Thickness display: SHOW_THICKNESS=%s" % str(SHOW_THICKNESS))
+
+        try:
+            opt = ExtAPI.Graphics.ViewOptions
+        except Exception as e:
+            Logger.warning("Graphics.ViewOptions not available: %s" % str(e))
+            return
+
+        try:
+            if not SHOW_THICKNESS:
+                # Hide shells
+                if hasattr(opt, "ShowShellThickness"):
+                    opt.ShowShellThickness = False
+                # Hide beams
+                if hasattr(opt, "ShowBeamThickness"):
+                    opt.ShowBeamThickness = False
+
+                Logger.info("Shell/beam thickness: OFF")
+            else:
+                # Show shells
+                if hasattr(opt, "ShowShellThickness"):
+                    opt.ShowShellThickness = True
+                # Show beams
+                if hasattr(opt, "ShowBeamThickness"):
+                    opt.ShowBeamThickness = True
+
+                Logger.info("Shell/beam thickness: ON")
+        except Exception as e:
+            Logger.warning("ThicknessDisplay.configure failed: %s" % str(e))
+
+
+# ==============================================================================
+# Mesh display control
+# ==============================================================================
+class MeshDisplay(object):
+    """Configure finite element mesh visibility.
+    
+    Controls whether the finite element mesh is visible in exported AVZ files.
+    Must be called before each Export3D() call as some operations (like
+    Graphics.Refresh() or result activation) may reset these settings.
+    
+    Compatible with ANSYS Mechanical 2022-2024+ through multiple API approaches.
+    
+    API Evolution:
+    - 2022: ExtAPI.DataModel.InternalObject["ds"].Graphics.ResultPrefs.edgeDisplay
+    - 2023+: ExtAPI.Graphics.ViewOptions.ShowMesh + ResultPreference.ExtraModelDisplay
+    """
+
+    @staticmethod
+    def configure():
+        """Apply mesh visibility settings - compatible with ANSYS 2022-2024+.
+        
+        Tries multiple API methods in priority order:
+        1. Modern API (2023+): ExtAPI.Graphics.ViewOptions
+        2. Legacy API (2022): InternalObject["ds"].Graphics.ResultPrefs.edgeDisplay
+        
+        For results display, also configures ExtraModelDisplay wireframe overlay.
+        """
+        Logger.info("Mesh display: SHOW_MESH=%s" % str(SHOW_MESH))
+        
+        mesh_visible = bool(SHOW_MESH)
+        success_count = 0
+
+        # ===================================================================
+        # METHOD 1: Modern API (2023+) - ExtAPI.Graphics.ViewOptions
+        # ===================================================================
+        try:
+            view_opts = ExtAPI.Graphics.ViewOptions
+            
+            # 1a. Set global mesh visibility
+            if hasattr(view_opts, "ShowMesh"):
+                view_opts.ShowMesh = mesh_visible
+                Logger.info("ExtAPI.Graphics.ViewOptions.ShowMesh = %s" % str(mesh_visible))
+                success_count += 1
+            
+            # 1b. Set result wireframe overlay
+            if hasattr(view_opts, "ResultPreference"):
+                try:
+                    result_prefs = view_opts.ResultPreference
+                    if mesh_visible:
+                        result_prefs.ExtraModelDisplay = MechanicalEnums.Graphics.ExtraModelDisplay.Wireframe
+                        Logger.info("ResultPreference.ExtraModelDisplay = Wireframe")
+                    else:
+                        result_prefs.ExtraModelDisplay = MechanicalEnums.Graphics.ExtraModelDisplay.NoWireframe
+                        Logger.info("ResultPreference.ExtraModelDisplay = NoWireframe")
+                    success_count += 1
+                except Exception as e:
+                    Logger.debug("ExtraModelDisplay failed: %s" % str(e))
+                    
+        except Exception as e:
+            Logger.debug("Modern API not available: %s" % str(e))
+
+        # ===================================================================
+        # METHOD 2: Legacy API (2022) - InternalObject ResultPrefs
+        # ===================================================================
+        try:
+            internal_obj = ExtAPI.DataModel.InternalObject["ds"]
+            result_prefs = internal_obj.Graphics.ResultPrefs
+            
+            # edgeDisplay values: 0=off, 1=undeformed, 2=deformed
+            if mesh_visible:
+                result_prefs.edgeDisplay = 2  # Show on deformed geometry
+                Logger.info("InternalObject ResultPrefs.edgeDisplay = 2")
+            else:
+                result_prefs.edgeDisplay = 0  # Hide mesh
+                Logger.info("InternalObject ResultPrefs.edgeDisplay = 0")
+            
+            success_count += 1
+            
+        except Exception as e:
+            Logger.debug("Legacy API not available: %s" % str(e))
+
+        # ===================================================================
+        # RESULT & REFRESH
+        # ===================================================================
+        if success_count == 0:
+            Logger.warning("FAILED: No mesh API available - mesh setting not applied")
+        else:
+            status = "ON" if mesh_visible else "OFF"
+            Logger.info("Mesh display: %s (%d API calls succeeded)" % (status, success_count))
+        
+        # Force graphics refresh to ensure changes take effect
+        try:
+            ExtAPI.Graphics.Refresh()
+            Logger.debug("Graphics refreshed")
+        except:
+            try:
+                Graphics.Refresh()
+            except:
+                pass
+
+
+# ==============================================================================
+# RESULT FACTORY
+# ==============================================================================
+
+class ResultFactory(object):
+    """Create result objects."""
+    
+    RESULT_MAP = {
+        "total deformation": "AddTotalDeformation",
+        "totaldef": "AddTotalDeformation",
+        "equivalent stress": "AddEquivalentStress",
+        "von-mises stress": "AddEquivalentStress",
+        "equiv stress": "AddEquivalentStress",
+
+        "equivalent total strain": "AddEquivalentTotalStrain",
+        "eqv total strain": "AddEquivalentTotalStrain",
+        "maximum principal stres": "AddMaximumPrincipalStress",
+        "middle principal stres": "AddMiddlePrincipalStress",
+        "minimum principal stres": "AddMinimumPrincipalStress",
+
+        "equivalent plastic strain": "AddEquivalentPlasticStrainRST",
+        "eqv plastic strain": "AddEquivalentPlasticStrainRST",
+        "accumulated equivalent plastic strain": "AddAccumulatedEquivalentPlasticStrain",
+        "accum eqv plastic strain": "AddAccumulatedEquivalentPlasticStrain",
+        "directional deformation": "AddDirectionalDeformation",
+        "dirdef": "AddDirectionalDeformation",
+    }
+    
+    @staticmethod
+    def parse_spec(spec):
+        """Parse result spec: 'Name' or 'Name:Axis' -> (base_name, axis)."""
+        text = str(spec).strip()
+        if ":" in text:
+            parts = text.split(":", 1)
+            base = parts[0].strip()
+            axis = parts[1].strip().upper()
+            return base, axis
+        return text, None
+    
+    @staticmethod
+    def _find_existing(solution, name):
+        """Find existing result by name (exact, case-insensitive)."""
+        try:
+            children = list(getattr(solution, "Children", []))
+        except:
+            return None
+        
+        name_lower = name.strip().lower()
+        
+        for obj in children:
+            try:
+                obj_name = str(getattr(obj, "Name", "")).strip().lower()
+                if obj_name == name_lower:
+                    return obj
+            except:
+                pass
+        
+        return None
+    
+    @staticmethod
+    def _apply_axis(result_obj, axis):
+        """Apply directional axis via NormalOrientation, if available."""
+        if not axis:
+            return
+        
+        try:
+            if not hasattr(result_obj, "NormalOrientation"):
+                return
+            
+            # Lazy import enum
+            try:
+                from Ansys.Mechanical.DataModel.Enums import NormalOrientationType
+            except:
+                Logger.warning("NormalOrientationType enum not available")
+                return
+            
+            a = str(axis).upper()
+            if a.startswith("X"):
+                result_obj.NormalOrientation = NormalOrientationType.XAxis
+            elif a.startswith("Y"):
+                result_obj.NormalOrientation = NormalOrientationType.YAxis
+            elif a.startswith("Z"):
+                result_obj.NormalOrientation = NormalOrientationType.ZAxis
+            else:
+                Logger.warning("Unknown axis '%s' for directional result" % str(axis))
+                return
+            
+            try:
+                name = str(getattr(result_obj, "Name", ""))
+            except:
+                name = ""
+            
+            Logger.info(
+                "Set NormalOrientation for %s to axis '%s'" %
+                (name, str(axis))
+            )
+        except Exception as e:
+            Logger.warning(
+                "Failed to apply axis '%s': %s" % (str(axis), str(e))
+            )
+    
+    @staticmethod
+    def create(solution, spec):
+        """Create or reuse result object (supports '...:X/Y/Z')."""
+        # Extract name + axis
+        if isinstance(spec, dict):
+            name_raw = str(spec.get("name", ""))
+        else:
+            name_raw = str(spec)
+        
+        base_name, axis = ResultFactory.parse_spec(name_raw)
+        
+        if not base_name:
+            raise ExecutionError("Empty result spec")
+        
+        # 1) Try reuse by full spec name
+        existing = ResultFactory._find_existing(solution, name_raw)
+        if existing is not None:
+            Logger.debug("Reusing existing result: %s" % name_raw)
+            ResultFactory._apply_axis(existing, axis)
+            return existing
+        
+        # 2) Try reuse by base name
+        existing = ResultFactory._find_existing(solution, base_name)
+        if existing is not None:
+            Logger.debug("Reusing existing result: %s" % base_name)
+            ResultFactory._apply_axis(existing, axis)
+            return existing
+        
+        # 3) Create new by base name
+        name_lower = base_name.strip().lower()
+        method_name = ResultFactory.RESULT_MAP.get(name_lower)
+        
+        if method_name:
+            method = getattr(solution, method_name, None)
+            if method:
+                Logger.debug("Creating result: %s" % base_name)
+                result_obj = method()
+                
+                # Rename with directional axis
+                try:
+                    if name_raw:
+                        result_obj.Name = name_raw
+                except:
+                    pass
+                
+                ResultFactory._apply_axis(result_obj, axis)
+                return result_obj
+        
+        # 4) Generic fallback: AddResult("...")
+        if hasattr(solution, "AddResult"):
+            try:
+                Logger.debug("Creating generic result: %s" % base_name)
+                result_obj = solution.AddResult(base_name)
+                
+                try:
+                    if name_raw:
+                        result_obj.Name = name_raw
+                except:
+                    pass
+                
+                ResultFactory._apply_axis(result_obj, axis)
+                return result_obj
+            except:
+                pass
+        
+        raise ExecutionError("Unknown result type: %s" % base_name)
+
+
+# ==============================================================================
+# RESULT EXPORTER
+# ==============================================================================
+
+class ResultExporter(object):
+    """Export results to AVZ."""
+    
+    @staticmethod
+    def sanitize_filename(name):
+        """Make name safe for filename."""
+        illegal = [":", "/", "\\", " ", "*", "?", '"', "<", ">", "|"]
+        s = str(name)
+        for ch in illegal:
+            s = s.replace(ch, "_")
+        return s
+    
+    @staticmethod
+    def _sanitize_project_name(name):
+        """Sanitize project/job name for filename prefix."""
+        illegal = [":", "/", "\\", " ", "*", "?", '"', "<", ">", "|"]
+        s = str(name)
+        for ch in illegal:
+            s = s.replace(ch, "_")
+        return s
+
+    @staticmethod
+    def _get_suffix(result_obj):
+        """Return short AVZ suffix code based on result type / orientation."""
+        try:
+            name = str(getattr(result_obj, "Name", "")).strip().lower()
+        except:
+            name = ""
+        
+        suffix = None
+        
+        # Basic types
+        if "total deformation" in name:
+            suffix = "USUM"
+        elif "equivalent stress" in name or "von-mises stress" in name or "von mises stress" in name:
+            suffix = "SEQV"
+        elif "equivalent total strain" in name:
+            suffix = "EPTOEQV"
+        elif "equivalent plastic strain" in name:
+            suffix = "EPPLEQV"
+        elif "accumulated equivalent plastic strain" in name:
+            suffix = "NLEPEQ"
+        
+        # Directional Deformation: UX / UY / UZ
+        elif "directional deformation" in name:
+            axis_suffix = None
+            try:
+                from Ansys.Mechanical.DataModel.Enums import NormalOrientationType
+            except:
+                NormalOrientationType = None
+            
+            try:
+                if NormalOrientationType is not None and hasattr(result_obj, "NormalOrientation"):
+                    ori = result_obj.NormalOrientation
+                    if ori == NormalOrientationType.XAxis:
+                        axis_suffix = "UX"
+                    elif ori == NormalOrientationType.YAxis:
+                        axis_suffix = "UY"
+                    elif ori == NormalOrientationType.ZAxis:
+                        axis_suffix = "UZ"
+            except:
+                axis_suffix = None
+            
+            if axis_suffix:
+                suffix = axis_suffix
+            else:
+                suffix = "UDIR"
+        
+        return suffix
+
+    @staticmethod
+    def evaluate(result_obj):
+        """Evaluate result if DO_EVAL enabled."""
+        if not DO_EVAL:
+            Logger.debug("Skipping evaluation (DO_EVAL=False)")
+            return
+        
+        name = str(getattr(result_obj, "Name", "Unknown"))
+        
+        try:
+            if hasattr(result_obj, "EvaluateAllResults"):
+                result_obj.EvaluateAllResults()
+                Logger.debug("%s evaluated (All)" % name)
+                return
+        except Exception as e:
+            Logger.debug("EvaluateAll failed: %s" % str(e))
+        
+        try:
+            if hasattr(result_obj, "Evaluate"):
+                result_obj.Evaluate()
+                Logger.debug("%s evaluated" % name)
+        except Exception as e:
+            Logger.warning("Evaluate failed: %s" % str(e))
+    
+    @staticmethod
+    def export(result_obj, out_dir, mode, index, time):
+        """Export result to AVZ file."""
+        name = str(getattr(result_obj, "Name", "Unknown"))
+        Logger.info("Exporting: %s" % name)
+        
+        # Configure time
+        ResultTimeConfig.configure(result_obj, mode, index, time)
+        
+        # Activate
+        try:
+            if hasattr(result_obj, "Activate"):
+                result_obj.Activate()
+        except Exception as e:
+            Logger.debug("Activate failed: %s" % str(e))
+        
+        # Evaluate
+        ResultExporter.evaluate(result_obj)
+    
+        # Re-apply time (some versions reset)
+        ResultTimeConfig.configure(result_obj, mode, index, time)
+        
+        # Apply deformation scale
+        DeformationScale.configure()
+
+        # Debug: log SetNumber / DisplayTime
+        if VERBOSE:
+            try:
+                res_name = getattr(result_obj, "Name", "Result")
+                sn = getattr(result_obj, "SetNumber", None)
+                dt = getattr(result_obj, "DisplayTime", None)
+                msg = "Exporting %s at SetNumber=%s, DisplayTime=%s" % (
+                    str(res_name), str(sn), str(dt)
+                )
+                Logger.info(msg)
+                try:
+                    debug_path = os.path.join(OUT_DIR, "_ipy_time_debug.log")
+                    f = open(debug_path, "a")
+                    try:
+                        f.write(msg + "\n")
+                    finally:
+                        f.close()
+                except:
+                    pass
+            except:
+                pass
+        
+        # Refresh graphics
+        try:
+            ExtAPI.Graphics.Refresh()
+        except:
+            try:
+                ExtAPI.Graphics.Redraw()
+            except:
+                pass
+        
+        # Build filename
+        try:
+            proj = ResultExporter._sanitize_project_name(JOB)
+        except:
+            proj = "job"
+        
+        suffix = ResultExporter._get_suffix(result_obj)
+        
+        if suffix:
+            filename = "%s_%s.avz" % (proj, suffix)
+        else:
+            # Fallback to sanitized name
+            filename = ResultExporter.sanitize_filename(name) + ".avz"
+        
+        avz_path = os.path.join(out_dir, filename)
+        
+        # Export
+        try:
+            ExtAPI.Graphics.Export3D(avz_path)
+            Logger.info("Exported: %s" % avz_path)
+            return avz_path
+        except Exception as e:
+            raise ExecutionError("Export3D failed: %s" % str(e))
+
+
+# ==============================================================================
+# MAIN EXECUTOR
+# ==============================================================================
+
+class Executor(object):
+    """Main execution orchestrator."""
+    
+    @staticmethod
+    def execute():
+        """Execute AVZ export workflow."""
+        Logger.info("=" * 60)
+        Logger.info("AVZ EXPORT START")
+        Logger.info("=" * 60)
+        Logger.info("Job: %s" % str(JOB))
+        Logger.info("Time mode: %s" % str(TIME_SELECTED_MODE))
+        Logger.info("Time index: %s" % str(TIME_SELECTED_INDEX))
+        Logger.info("Time value: %s" % str(TIME_SELECTED_TIME))
+        Logger.info("=" * 60)
+        
+        # Make TIME_SELECTED_INDEX and TIME_SELECTED_MODE modifiable
+        global TIME_SELECTED_MODE
+        global TIME_SELECTED_INDEX
+        
+        # DPF time resolution for VALUE mode
+        mode_str = str(TIME_SELECTED_MODE).upper()
+        effective_index = int(TIME_SELECTED_INDEX)
+        
+        if mode_str == "VALUE":
+            Logger.info("Resolving VALUE to INDEX via DPF...")
+            t_val = float(TIME_SELECTED_TIME)
+            
+            if t_val > 0.0:
+                idx = DPFTimeResolver.resolve_time_to_index(RST_PATH, t_val)
+                if idx is not None:
+                    TIME_SELECTED_MODE = "INDEX"
+                    TIME_SELECTED_INDEX = idx
+                    effective_index = idx
+                    Logger.info("DPF resolved VALUE:%.6g to INDEX:%d" % (t_val, idx))
+                else:
+                    Logger.warning("DPF resolution failed, keeping VALUE mode")
+            else:
+                Logger.warning("Invalid time value: %s" % str(t_val))
+        
+        Logger.info("Effective mode: %s, index: %d" %
+                    (str(TIME_SELECTED_MODE), effective_index))
+        
+        # Ensure output directory
+        if not os.path.isdir(OUT_DIR):
+            try:
+                os.makedirs(OUT_DIR)
+            except Exception as e:
+                raise ExecutionError("Cannot create output dir: %s" % str(e))
+        
+        # Validate geometry
+        model = GeometryValidator.validate()
+        
+        # Set display units
+        UnitSystemManager.set_display_units(DISPLAY_UNITS_ENUM_NAME)
+        
+        # Get analysis
+        analysis = AnalysisLocator.get_analysis()
+        solution = analysis.Solution
+        
+        # Read RST
+        RSTReader.read_results(
+            solution,
+            RST_PATH,
+            MODEL_RESULT_UNITS_ENUM_NAME
+        )
+        
+        # Set global solution time
+        Logger.info("Setting global solution time to index=%d" % effective_index)
+        
+        if not TimeSelector.set_solution_time(solution, effective_index):
+            Logger.warning("Standard time setting failed, trying temp result method")
+            if not TimeSelector.set_via_temp_result(solution, effective_index):
+                Logger.warning("All time setting methods failed - results may use wrong time step")
+        
+        # MAIN
+        Logger.info("%s v%s started" % (SCRIPT_NAME, SCRIPT_VERSION))
+        
+        # Configure deformation
+        DeformationScale.configure()
+
+        # Configure shell/beam thickness display
+        ThicknessDisplay.configure()
+        
+        # Configure Show Mesh
+        MeshDisplay.configure()
+
+        # Activate solution
+        try:
+            if hasattr(solution, "Activate"):
+                solution.Activate()
+                Logger.info("Solution activated")
+        except Exception as e:
+            Logger.debug("Solution activate failed: %s" % str(e))
+        
+        # Create and export results
+        exported = []
+        result_names = []
+        
+        try:
+            count = len(RESULTS)
+        except:
+            count = 0
+        
+        Logger.info("Exporting %d result(s)..." % count)
+        
+        for spec in RESULTS:
+            try:
+                result_obj = ResultFactory.create(solution, spec)
+                avz_path = ResultExporter.export(
+                    result_obj,
+                    OUT_DIR,
+                    TIME_SELECTED_MODE,
+                    effective_index,
+                    TIME_SELECTED_TIME
+                )
+                exported.append(str(avz_path))
+                result_names.append(str(spec))
+            except Exception as e:
+                Logger.error("Export failed for '%s': %s" % (str(spec), str(e)))
+                raise
+        
+        # Report success
+        Logger.info("=" * 60)
+        Logger.info("SUCCESS: Exported %d file(s)" % len(exported))
+        Logger.info("=" * 60)
+        
+        StatusReporter.success(JOB, exported, result_names)
+
+
+# ==============================================================================
+# ENTRY POINT
+# ==============================================================================
+
+try:
+    Executor.execute()
+
+except Exception as exc:
+    Logger.error("=" * 60)
+    Logger.error("FATAL ERROR")
+    Logger.error(str(exc))
+    Logger.error("=" * 60)
+    
+    try:
+        tb = traceback.format_exc()
+        Logger.error(tb)
+        StatusReporter.failure(JOB, str(exc), tb)
+    except:
+        StatusReporter.failure(JOB, str(exc))
+    
+    raise
