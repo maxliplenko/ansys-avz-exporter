@@ -115,6 +115,7 @@ ExportToAVZ.bat
 - `mech_export_avz.ipy` is required for execution inside Mechanical
 - The tool does not include ANSYS data files
 - Designed for engineering automation workflows
+- Compatible with legacy (pre-PyAnsys) workflows (Ansys 2022)
 
 ---
 
